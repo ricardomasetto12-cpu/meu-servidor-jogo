@@ -1,92 +1,145 @@
+require("dotenv").config();
+
 const express = require("express");
+const mongoose = require("mongoose");
 const cors = require("cors");
-const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
+const WebSocket = require("ws");
 
 const app = express();
-app.use(cors());
+
 app.use(express.json());
+app.use(cors());
 
-const SECRET_KEY = "TROQUE_POR_UMA_CHAVE_BEM_FORTE";
+/* DATABASE */
 
-// Banco simples em memória (depois podemos colocar banco real)
-let players = {};
-
-// ================= LOGIN =================
-app.post("/login", (req, res) => {
-  const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ error: "Dados inválidos" });
-  }
-
-  if (!players[username]) {
-    players[username] = {
-      password,
-      money: 0,
-      level: 1,
-      xp: 0,
-    };
-  }
-
-  if (players[username].password !== password) {
-    return res.status(401).json({ error: "Senha incorreta" });
-  }
-
-  const token = jwt.sign({ username }, SECRET_KEY, { expiresIn: "7d" });
-
-  res.json({ token });
+mongoose.connect(process.env.MONGO_URL)
+.then(() => console.log("✅ MongoDB conectado"))
+.catch(err => {
+  console.error("❌ Erro MongoDB:", err);
+  process.exit(1);
 });
 
-// ================= MIDDLEWARE =================
-function autenticar(req, res, next) {
-  const authHeader = req.headers["authorization"];
-  if (!authHeader) return res.status(403).json({ error: "Sem token" });
+/* PLAYER MODEL */
 
-  const token = authHeader.split(" ")[1];
-
-  jwt.verify(token, SECRET_KEY, (err, user) => {
-    if (err) return res.status(403).json({ error: "Token inválido" });
-    req.user = user;
-    next();
-  });
-}
-
-// ================= CLICK =================
-app.post("/click", autenticar, (req, res) => {
-  const username = req.user.username;
-  const player = players[username];
-
-  // Cálculo protegido no servidor
-  player.money += 10;
-  player.xp += 5;
-
-  if (player.xp >= 100) {
-    player.level++;
-    player.xp = 0;
-  }
-
-  res.json({
-    money: player.money,
-    level: player.level,
-  });
+const Player = mongoose.model("Player",{
+  username:{type:String,required:true,unique:true},
+  password:{type:String,required:true},
+  score:{type:Number,default:0},
+  upgrade:{type:Number,default:1}
 });
 
-// ================= RANKING =================
-app.get("/ranking", (req, res) => {
-  const ranking = Object.keys(players)
-    .map((username) => ({
+/* CHAT MODEL */
+
+const Chat = mongoose.model("Chat",{
+  username:String,
+  message:String,
+  time:{type:Date,default:Date.now}
+});
+
+/* TEST ROUTE (IMPORTANTE PRO RAILWAY) */
+
+app.get("/", (req,res)=>{
+  res.send("🚀 CLICKER SERVER ONLINE");
+});
+
+/* AUTH */
+
+app.post("/auth",async(req,res)=>{
+
+  const {username,password}=req.body;
+
+  if(!username || !password){
+    return res.status(400).send("Usuário e senha obrigatórios");
+  }
+
+  let player=await Player.findOne({username});
+
+  if(!player){
+
+    const hash=await bcrypt.hash(password,10);
+
+    player=await Player.create({
       username,
-      money: players[username].money,
-    }))
-    .sort((a, b) => b.money - a.money)
-    .slice(0, 10);
+      password:hash,
+      score:0,
+      upgrade:1
+    });
+
+  }else{
+
+    const ok=await bcrypt.compare(password,player.password);
+    if(!ok) return res.status(401).send("Senha inválida");
+
+  }
+
+  // NÃO enviar senha para o frontend
+  const {password:_, ...playerData} = player.toObject();
+
+  res.json(playerData);
+
+});
+
+/* SAVE GAME */
+
+app.post("/save",async(req,res)=>{
+
+  const {id,score,upgrade}=req.body;
+
+  if(!id) return res.status(400).send("ID inválido");
+
+  await Player.updateOne(
+    {_id:id},
+    {$set:{score,upgrade}}
+  );
+
+  res.json({ok:true});
+
+});
+
+/* RANKING */
+
+app.get("/ranking",async(req,res)=>{
+
+  const ranking=await Player.find()
+  .sort({score:-1})
+  .limit(20)
+  .select("-password");
 
   res.json(ranking);
+
 });
 
-// ================= PORTA RENDER =================
-const PORT = process.env.PORT || 3000;
+/* HTTP SERVER */
 
-app.listen(PORT, () => {
-  console.log("Servidor rodando na porta " + PORT);
+const PORT=process.env.PORT||3000;
+
+const server = app.listen(PORT,()=>{
+  console.log("🔥 CLICKER SERVER ONLINE NA PORTA", PORT);
+});
+
+/* WEBSOCKET CHAT REALTIME */
+
+const wss = new WebSocket.Server({ server });
+
+let clients=[];
+
+wss.on("connection",(ws)=>{
+
+  clients.push(ws);
+
+  ws.on("message",(msg)=>{
+
+    clients.forEach(client=>{
+      if(client.readyState===1){
+        client.send(msg.toString());
+      }
+    });
+
+  });
+
+  ws.on("close",()=>{
+    clients = clients.filter(c=>c!==ws);
+  });
+
 });
